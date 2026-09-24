@@ -73,9 +73,11 @@ class RPCAuthMap:
         self.__show_all = show_all
         self.__probe_pipes = probe_pipes
         self.__timeout = timeout
+        self.__dead = set()
 
     def scan(self, target):
         """Scan one host. Returns (relay_count, list_of_output_lines)."""
+        self.__dead = set()          # per-host cache of unreachable bindings
         out = []
         entries = self.__fetch_endpoints(target)
         if entries is None:
@@ -142,6 +144,14 @@ class RPCAuthMap:
             base['note'] = 'transport not probed (%s)' % proto
             return base
 
+        # Reachability cache: a binding whose port already failed to connect on
+        # this host is not retried by every other interface sharing that port.
+        if binding in self.__dead:
+            base['accepted'] = {n: False for n, _, _ in AUTH_LEVELS}
+            base['verdict'] = 'unreachable'
+            base['note'] = 'port cached dead'
+            return base
+
         try:
             iface_bin = uuid.uuidtup_to_bin(
                 (iface.split(' ')[0], iface.split('v')[-1]))
@@ -150,15 +160,33 @@ class RPCAuthMap:
             base['note'] = 'could not parse interface id: %s' % e
             return base
 
+        accepted = {}
+        dead = False
         for name, level, authenticated in AUTH_LEVELS:
-            ok, _detail = self.__try_bind(binding, iface_bin, level, authenticated)
-            base['accepted'][name] = ok
+            status, _detail = self.__try_bind(binding, iface_bin, level, authenticated)
+            if status == 'connect-failed':
+                # Port unreachable. No point testing further levels, and cache
+                # it so sibling interfaces on this port skip straight past.
+                dead = True
+                accepted[name] = False
+                break
+            accepted[name] = (status == 'ok')
 
-        auth_ok = {n: base['accepted'][n] for n in ('connect', 'integrity', 'privacy')}
+        if dead:
+            self.__dead.add(binding)
+            for name, _, _ in AUTH_LEVELS:
+                accepted.setdefault(name, False)
+            base['accepted'] = accepted
+            base['verdict'] = 'unreachable'
+            base['note'] = 'connect failed'
+            return base
+
+        base['accepted'] = accepted
+        auth_ok = {n: accepted[n] for n in ('connect', 'integrity', 'privacy')}
         base['ntlm'] = any(auth_ok.values())
 
         for name in ('connect', 'integrity', 'privacy'):
-            if base['accepted'][name]:
+            if accepted[name]:
                 base['floor'] = name
                 break
 
@@ -166,7 +194,7 @@ class RPCAuthMap:
             base['verdict'] = 'relay-viable'
         elif base['floor'] in ('integrity', 'privacy'):
             base['verdict'] = 'hardened'
-        elif base['accepted'].get('none'):
+        elif accepted.get('none'):
             base['verdict'] = 'anon-only'
         else:
             base['verdict'] = 'no-bind'
@@ -194,12 +222,16 @@ class RPCAuthMap:
 
         try:
             dce.connect()
-            dce.bind(iface_bin)
-            return True, ''
-        except DCERPCException as e:
-            return False, str(e)
         except Exception as e:
-            return False, str(e)
+            return 'connect-failed', str(e)
+
+        try:
+            dce.bind(iface_bin)
+            return 'ok', ''
+        except DCERPCException as e:
+            return 'bind-denied', str(e)
+        except Exception as e:
+            return 'bind-denied', str(e)
         finally:
             self.__safe_disconnect(dce)
 
@@ -234,6 +266,7 @@ class RPCAuthMap:
             'hardened':     '[-]',
             'anon-only':    '[a]',
             'no-bind':      '[x]',
+            'unreachable':  '[u]',
             'skipped':      '[ ]',
             'error':        '[!]',
         }.get(info['verdict'], '[?]')
