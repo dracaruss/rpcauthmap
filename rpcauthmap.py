@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from impacket import version, uuid
 from impacket.examples import logger
 from impacket.dcerpc.v5 import transport, epm
+from impacket.dcerpc.v5.ndr import NDRCALL
 from impacket.dcerpc.v5.rpcrt import (
     RPC_C_AUTHN_WINNT,
     RPC_C_AUTHN_LEVEL_NONE,
@@ -78,6 +79,16 @@ KNOWN_IFACES = {
 }
 
 _print_lock = threading.Lock()
+
+
+class _BogusCall(NDRCALL):
+    # An out-of-range opnum with an empty stub. If the interface enforces its
+    # auth level at call time, the RPC runtime rejects on auth (access_denied)
+    # BEFORE dispatch; if it accepts the unsigned call, it reaches dispatch and
+    # faults on the bad opnum instead (op_rng_error). That difference is the
+    # signal for whether sealing is actually enforced on the operation path.
+    opnum = 0x7FFF
+    structure = ()
 USE_COLOR = False           # set in main() based on tty / --no-color
 _ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
@@ -122,9 +133,9 @@ class RPCAuthMap:
         self.__dead = set()
         entries = self.__fetch_endpoints(target)
         if entries is None:
-            return 0, ['[!] %s : endpoint mapper unreachable' % target], 'unreachable'
+            return 0, 0, ['[!] %s : endpoint mapper unreachable' % target], 'unreachable'
         if not entries:
-            return 0, ['[-] %s : no endpoints returned' % target], 'empty'
+            return 0, 0, ['[-] %s : no endpoints returned' % target], 'empty'
 
         seen = set()
         results = []
@@ -142,23 +153,27 @@ class RPCAuthMap:
         # Probe everything first, then render grouped under one host header.
         shown = []
         relay_candidates = 0
+        call_open = 0
         for iface, binding, annotation in results:
             info = self.__probe(iface, binding)
             if info['verdict'] == 'relay-viable':
                 relay_candidates += 1
+                if info.get('call') == 'call-open':
+                    call_open += 1
             if info['ntlm'] or self.__show_all:
                 shown.append((iface, binding, annotation, info))
 
-        header = '=== %s ===  (%d endpoints, %d relay-viable)' % (
-            target, len(results), relay_candidates)
-        header = col(header, 'bgreen' if relay_candidates else 'bcyan')
+        header = '=== %s ===  (%d endpoints, %d relay-viable, %d call-open)' % (
+            target, len(results), relay_candidates, call_open)
+        header = col(header, 'bgreen' if call_open else
+                     ('cyan' if relay_candidates else 'bcyan'))
 
         out = [header]
         for iface, binding, annotation, info in shown:
             out.extend(self.__format_entry(iface, binding, annotation, info))
         if not shown:
             out.append('    (no NTLM-capable endpoints; use -all to see the rest)')
-        return relay_candidates, out, 'scanned'
+        return relay_candidates, call_open, out, 'scanned'
 
     def __fetch_endpoints(self, target):
         rpctransport = transport.DCERPCTransportFactory(r'ncacn_ip_tcp:%s' % target)
@@ -228,6 +243,7 @@ class RPCAuthMap:
             return base
 
         base['accepted'] = accepted
+        base['call'] = None
         base['ntlm'] = any(accepted[n] for n in ('connect', 'integrity', 'privacy'))
         for name in ('connect', 'integrity', 'privacy'):
             if accepted[name]:
@@ -236,6 +252,9 @@ class RPCAuthMap:
 
         if base['floor'] == 'connect':
             base['verdict'] = 'relay-viable'
+            # Second stage: bind succeeded unsigned, but does the OPERATION path
+            # enforce sealing? Fire a bogus opnum and read which gate answers.
+            base['call'] = self.__probe_call(binding, iface_bin)
         elif base['floor'] in ('integrity', 'privacy'):
             base['verdict'] = 'hardened'
         elif accepted.get('none'):
@@ -243,6 +262,51 @@ class RPCAuthMap:
         else:
             base['verdict'] = 'no-bind'
         return base
+
+    def __probe_call(self, binding, iface_bin):
+        """Bind at connect level, invoke an out-of-range opnum, and classify the
+        fault: 'call-open' (reached dispatch, unsigned call accepted),
+        'call-enforced' (auth rejected before dispatch), or 'call-unknown'.
+        """
+        rpctransport = transport.DCERPCTransportFactory(binding)
+        if hasattr(rpctransport, 'set_credentials'):
+            rpctransport.set_credentials(self.__username, self.__password,
+                                         self.__domain, self.__lmhash,
+                                         self.__nthash)
+        try:
+            rpctransport.set_connect_timeout(self.__timeout)
+        except Exception:
+            pass
+
+        dce = rpctransport.get_dce_rpc()
+        try:
+            dce.set_auth_type(RPC_C_AUTHN_WINNT)
+            dce.set_auth_level(RPC_C_AUTHN_LEVEL_CONNECT)
+        except Exception:
+            pass
+
+        try:
+            dce.connect()
+            dce.bind(iface_bin)
+        except Exception:
+            self.__safe_disconnect(dce)
+            return 'call-unknown'
+
+        try:
+            dce.request(_BogusCall())
+            # No fault at all: the call was dispatched (unsigned accepted).
+            return 'call-open'
+        except DCERPCException as e:
+            msg = str(e).lower()
+            if 'op_rng' in msg or 'op rng' in msg or 'invalid_pres' in msg:
+                return 'call-open'         # reached dispatch, faulted on opnum
+            if 'access_denied' in msg or 'unsupported_authn' in msg:
+                return 'call-enforced'     # rejected on auth before dispatch
+            return 'call-unknown'
+        except Exception:
+            return 'call-unknown'
+        finally:
+            self.__safe_disconnect(dce)
 
     def __try_bind(self, binding, iface_bin, level, authenticated):
         rpctransport = transport.DCERPCTransportFactory(binding)
@@ -350,6 +414,15 @@ class RPCAuthMap:
         lines.append('      levels  : %s' % levels_str)
         lines.append('      floor   : %s' % (info['floor'] or 'none/anon'))
         lines.append('      verdict : %s' % vshown)
+        call = info.get('call')
+        if call == 'call-open':
+            lines.append('      call    : %s' %
+                         col('call-open (unsigned op reached dispatch, genuine relay target)', 'bred'))
+        elif call == 'call-enforced':
+            lines.append('      call    : %s' %
+                         col('call-enforced (sealing required at call; relay dies here)', 'green'))
+        elif call == 'call-unknown':
+            lines.append('      call    : call-unknown (inconclusive; verify manually)')
         lines.append('')
         return lines
 
@@ -468,16 +541,17 @@ def main():
         )
         return host, mapper.scan(host)
 
-    total_relay = hosts_with_hits = hosts_scanned = hosts_quiet = 0
+    total_relay = total_call_open = hosts_with_hits = hosts_scanned = hosts_quiet = 0
     with ThreadPoolExecutor(max_workers=max(1, options.threads)) as pool:
         futures = [pool.submit(worker, h) for h in targets]
         for fut in as_completed(futures):
-            host, (relay_count, lines, status) = fut.result()
+            host, (relay_count, call_open, lines, status) = fut.result()
             if status == 'scanned':
                 hosts_scanned += 1
                 if relay_count:
                     hosts_with_hits += 1
                 total_relay += relay_count
+                total_call_open += call_open
             else:
                 hosts_quiet += 1
 
@@ -493,8 +567,9 @@ def main():
     summary1 = ('[*] Sweep complete: %d target(s) probed; %d live RPC host(s) '
                 'scanned, %d unreachable/no-RPC.'
                 % (len(targets), hosts_scanned, hosts_quiet))
-    summary2 = ('[*] %d relay-viable RPC endpoint(s) found on %d host(s).'
-                % (total_relay, hosts_with_hits))
+    summary2 = ('[*] %d relay-viable bind(s) on %d host(s); of those, %d are '
+                'call-open (unsigned operations actually dispatch).'
+                % (total_relay, hosts_with_hits, total_call_open))
     print(summary1)
     print(summary2)
     if outfh:
