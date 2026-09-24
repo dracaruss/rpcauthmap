@@ -14,22 +14,25 @@
 #         integrity -> packet integrity required (signing enforced)
 #         privacy   -> packet integrity + encryption required
 #
-# Interpretation for relay: a relayed NTLM session has no session key and so
-# cannot sign. If the floor is "connect", signing is not required and the
-# endpoint is a candidate relay destination. If the floor is "integrity" or
-# "privacy", a relay fails at the RPC layer regardless of SMB settings.
+# Relay reasoning: a relayed NTLM session has no session key and cannot sign.
+# A floor of "connect" means signing is not required and the endpoint is a
+# candidate relay DESTINATION. "integrity"/"privacy" means a relay fails at the
+# RPC layer regardless of SMB settings. Knowing an interface accepts a relay is
+# only the transport gate; the operation you call is defined by that interface's
+# MS-* spec (opnums/NDR), and the relayed identity must be authorized for it.
 #
-# Targets can be a single host, a CIDR (192.168.1.0/24), a comma-separated
-# list, or a file of hosts referenced as @hosts.txt. Hosts are swept
-# concurrently.
+# Targets: single host, CIDR (192.168.1.0/24), comma list, or @file. Swept
+# concurrently. Live RPC hosts are grouped under a coloured per-host header;
+# dead/no-RPC hosts are summarised, not printed (use -v to show them).
 #
-# Caveat: this tests acceptance at BIND time. A server can, in principle, accept
-# a low-level bind and enforce a higher level only at call time on specific
-# opnums. Confirm anything ambiguous with a real authenticated call or a capture.
+# Caveat: this tests acceptance at BIND time. A server can accept a low-level
+# bind and enforce a higher level only at call time on specific opnums. Confirm
+# anything ambiguous with a real authenticated call or a capture.
 #
 # For authorized security testing only.
 
 import os
+import re
 import sys
 import logging
 import argparse
@@ -57,7 +60,43 @@ AUTH_LEVELS = [
     ('privacy',   RPC_C_AUTHN_LEVEL_PKT_PRIVACY,   True),
 ]
 
+# Curated map of relay/coercion-relevant interface UUIDs to their protocol.
+# Naming the protocol tells you which MS-* spec (and which impacket / ntlmrelayx
+# module) defines the opnums and NDR argument format for that endpoint.
+KNOWN_IFACES = {
+    '12345678-1234-abcd-ef00-0123456789ab': 'MS-RPRN (spoolss / PrinterBug)',
+    'c681d488-d850-11d0-8c52-00c04fd90f7e': 'MS-EFSR (efsrpc / PetitPotam)',
+    'df1941c5-fe89-4e79-bf10-463657acf44d': 'MS-EFSR (efsrpc / PetitPotam)',
+    '4fc742e0-4a10-11cf-8273-00aa004ae673': 'MS-DFSNM (DFSCoerce)',
+    '367abb81-9844-35f1-ad32-98f038001003': 'MS-SCMR (svcctl)',
+    '86d35949-83c9-4044-b424-db363231fd0c': 'MS-TSCH (task scheduler)',
+    '12345778-1234-abcd-ef00-0123456789ac': 'MS-SAMR (samr)',
+    '12345778-1234-abcd-ef00-0123456789ab': 'MS-LSAD/LSARPC (lsarpc)',
+    '12345678-1234-abcd-ef00-01234567cffb': 'MS-NRPC (netlogon)',
+    'e3514235-4b06-11d1-ab04-00c04fc2dcd2': 'MS-DRSR (drsuapi / DCSync)',
+    '99fcfec4-5260-101b-bbcb-00aa0021347a': 'IOXIDResolver (OXID)',
+}
+
 _print_lock = threading.Lock()
+USE_COLOR = False           # set in main() based on tty / --no-color
+_ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+C = {
+    'reset': '\x1b[0m', 'bold': '\x1b[1m',
+    'red': '\x1b[31m', 'green': '\x1b[32m', 'yellow': '\x1b[33m',
+    'cyan': '\x1b[36m', 'bred': '\x1b[1;31m', 'bgreen': '\x1b[1;32m',
+    'bcyan': '\x1b[1;36m',
+}
+
+
+def col(text, name):
+    if not USE_COLOR:
+        return text
+    return '%s%s%s' % (C[name], text, C['reset'])
+
+
+def strip_ansi(text):
+    return _ANSI.sub('', text)
 
 
 class RPCAuthMap:
@@ -76,20 +115,22 @@ class RPCAuthMap:
         self.__dead = set()
 
     def scan(self, target):
-        """Scan one host. Returns (relay_count, list_of_output_lines)."""
-        self.__dead = set()          # per-host cache of unreachable bindings
-        out = []
+        """Scan one host. Returns (relay_count, lines, status).
+
+        status: 'unreachable' | 'empty' | 'scanned'.
+        """
+        self.__dead = set()
         entries = self.__fetch_endpoints(target)
         if entries is None:
-            return 0, ['[!] %s : endpoint mapper unreachable' % target]
+            return 0, ['[!] %s : endpoint mapper unreachable' % target], 'unreachable'
         if not entries:
-            return 0, ['[-] %s : no endpoints returned' % target]
+            return 0, ['[-] %s : no endpoints returned' % target], 'empty'
 
         seen = set()
         results = []
         for entry in entries:
             floors = entry['tower']['Floors']
-            iface = str(floors[0])                       # "uuid vX.Y"
+            iface = str(floors[0])
             binding = self.__rehost(epm.PrintStringBinding(floors), target)
             annotation = self.__clean_annotation(entry['annotation'])
             key = (iface, binding)
@@ -98,17 +139,26 @@ class RPCAuthMap:
             seen.add(key)
             results.append((iface, binding, annotation))
 
-        out.append('=== %s : %d unique endpoint(s) ===' % (target, len(results)))
+        # Probe everything first, then render grouped under one host header.
+        shown = []
         relay_candidates = 0
         for iface, binding, annotation in results:
             info = self.__probe(iface, binding)
             if info['verdict'] == 'relay-viable':
                 relay_candidates += 1
             if info['ntlm'] or self.__show_all:
-                out.extend(self.__format_entry(iface, binding, annotation, info))
-        out.append('--- %s : %d relay-viable RPC endpoint(s) ---'
-                   % (target, relay_candidates))
-        return relay_candidates, out
+                shown.append((iface, binding, annotation, info))
+
+        header = '=== %s ===  (%d endpoints, %d relay-viable)' % (
+            target, len(results), relay_candidates)
+        header = col(header, 'bgreen' if relay_candidates else 'bcyan')
+
+        out = [header]
+        for iface, binding, annotation, info in shown:
+            out.extend(self.__format_entry(iface, binding, annotation, info))
+        if not shown:
+            out.append('    (no NTLM-capable endpoints; use -all to see the rest)')
+        return relay_candidates, out, 'scanned'
 
     def __fetch_endpoints(self, target):
         rpctransport = transport.DCERPCTransportFactory(r'ncacn_ip_tcp:%s' % target)
@@ -144,8 +194,6 @@ class RPCAuthMap:
             base['note'] = 'transport not probed (%s)' % proto
             return base
 
-        # Reachability cache: a binding whose port already failed to connect on
-        # this host is not retried by every other interface sharing that port.
         if binding in self.__dead:
             base['accepted'] = {n: False for n, _, _ in AUTH_LEVELS}
             base['verdict'] = 'unreachable'
@@ -165,8 +213,6 @@ class RPCAuthMap:
         for name, level, authenticated in AUTH_LEVELS:
             status, _detail = self.__try_bind(binding, iface_bin, level, authenticated)
             if status == 'connect-failed':
-                # Port unreachable. No point testing further levels, and cache
-                # it so sibling interfaces on this port skip straight past.
                 dead = True
                 accepted[name] = False
                 break
@@ -182,9 +228,7 @@ class RPCAuthMap:
             return base
 
         base['accepted'] = accepted
-        auth_ok = {n: accepted[n] for n in ('connect', 'integrity', 'privacy')}
-        base['ntlm'] = any(auth_ok.values())
-
+        base['ntlm'] = any(accepted[n] for n in ('connect', 'integrity', 'privacy'))
         for name in ('connect', 'integrity', 'privacy'):
             if accepted[name]:
                 base['floor'] = name
@@ -198,7 +242,6 @@ class RPCAuthMap:
             base['verdict'] = 'anon-only'
         else:
             base['verdict'] = 'no-bind'
-
         return base
 
     def __try_bind(self, binding, iface_bin, level, authenticated):
@@ -244,10 +287,6 @@ class RPCAuthMap:
 
     @staticmethod
     def __rehost(binding, target):
-        # PrintStringBinding embeds whatever host the tower carried (sometimes a
-        # NetBIOS name). Force the host we actually scanned so probing connects
-        # by IP. Format is proto:host[endpoint].
-        import re
         m = re.match(r'^(ncacn_ip_tcp|ncacn_np|ncacn_http):(.*?)(\[.*\])$', binding)
         if m:
             return '%s:%s%s' % (m.group(1), target, m.group(3))
@@ -260,42 +299,62 @@ class RPCAuthMap:
         return (annotation or '').rstrip('\x00').strip()
 
     @staticmethod
-    def __format_entry(iface, binding, annotation, info):
+    def __endpoint_label(binding):
+        # ncacn_ip_tcp:host[port] -> "tcp/port"; ncacn_np:host[\pipe\x] -> "np \pipe\x"
+        m = re.match(r'^(ncacn_ip_tcp|ncacn_np|ncacn_http):.*?\[(.*)\]$', binding)
+        if not m:
+            return binding
+        proto = {'ncacn_ip_tcp': 'tcp', 'ncacn_np': 'np', 'ncacn_http': 'http'}[m.group(1)]
+        return '%s/%s' % (proto, m.group(2))
+
+    def __format_entry(self, iface, binding, annotation, info):
+        verdict = info['verdict']
         tag = {
-            'relay-viable': '[+]',
-            'hardened':     '[-]',
-            'anon-only':    '[a]',
-            'no-bind':      '[x]',
-            'unreachable':  '[u]',
-            'skipped':      '[ ]',
-            'error':        '[!]',
-        }.get(info['verdict'], '[?]')
+            'relay-viable': '[+]', 'hardened': '[-]', 'anon-only': '[a]',
+            'no-bind': '[x]', 'unreachable': '[u]', 'skipped': '[ ]',
+            'error': '[!]',
+        }.get(verdict, '[?]')
 
+        # Protocol name from the interface UUID (falls back to EPM annotation).
+        proto_name = KNOWN_IFACES.get(iface.split(' ')[0].lower(), annotation or '')
+
+        # Colour the levels string; an accepted low level is the dangerous signal.
         acc = info['accepted']
-        levels_str = ', '.join(
-            '%s=%s' % (n, 'ok' if acc.get(n) else '-')
-            for n in ('none', 'connect', 'integrity', 'privacy')
-        )
+        parts = []
+        for n in ('none', 'connect', 'integrity', 'privacy'):
+            ok = acc.get(n)
+            token = '%s=%s' % (n, 'ok' if ok else '-')
+            if ok and n in ('none', 'connect'):
+                token = col(token, 'red')          # unsigned/anon = dangerous
+            elif ok:
+                token = col(token, 'green')        # integrity/privacy = safe
+            parts.append(token)
+        levels_str = ', '.join(parts)
 
-        lines = ['%s %s' % (tag, binding),
-                 '    Interface : %s' % iface]
-        if annotation:
-            lines.append('    Service   : %s' % annotation)
-        lines.append('    NTLM      : %s' % ('yes' if info['ntlm'] else 'no'))
-        lines.append('    Levels    : %s' % levels_str)
-        lines.append('    Floor     : %s' % (info['floor'] or 'none/anon'))
-        lines.append('    Verdict   : %s%s' % (
-            info['verdict'], ' (%s)' % info['note'] if info['note'] else ''))
+        if verdict == 'relay-viable':
+            vshown = col('relay-viable', 'bred')
+            tag = col(tag, 'bred')
+        elif verdict == 'hardened':
+            vshown = col('hardened', 'green')
+        else:
+            vshown = verdict
+        if info['note']:
+            vshown += ' (%s)' % info['note']
+
+        label = col(self.__endpoint_label(binding), 'yellow')
+        proto_col = col(proto_name, 'cyan') if proto_name else ''
+
+        lines = ['  %s %s   %s' % (tag, label, proto_col)]
+        lines.append('      iface   : %s' % iface)
+        lines.append('      ntlm    : %s' % ('yes' if info['ntlm'] else 'no'))
+        lines.append('      levels  : %s' % levels_str)
+        lines.append('      floor   : %s' % (info['floor'] or 'none/anon'))
+        lines.append('      verdict : %s' % vshown)
         lines.append('')
         return lines
 
 
 def expand_targets(spec):
-    """Expand a target spec into a list of host strings.
-
-    Supports: single host/IP, CIDR (192.168.1.0/24), comma-separated list,
-    and @file (one host per line, # comments allowed).
-    """
     hosts = []
     for token in spec.split(','):
         token = token.strip()
@@ -319,8 +378,7 @@ def expand_targets(spec):
             else:
                 hosts.append(str(net.network_address))
         except ValueError:
-            hosts.append(token)          # hostname or single IP
-    # De-duplicate, preserve order.
+            hosts.append(token)
     seen, ordered = set(), []
     for h in hosts:
         if h not in seen:
@@ -330,8 +388,6 @@ def expand_targets(spec):
 
 
 def parse_creds(prefix):
-    """Split the optional [[domain/]user[:pass]@] credential prefix."""
-    import re
     domain, username, password = re.compile(
         r'(?:([^/@:]*)/)?([^@:]*)(?::([^@]*))?'
     ).match(prefix).groups('')
@@ -339,6 +395,7 @@ def parse_creds(prefix):
 
 
 def main():
+    global USE_COLOR
     print(version.BANNER)
     parser = argparse.ArgumentParser(
         add_help=True,
@@ -358,6 +415,12 @@ def main():
                         help='per-attempt connect timeout in seconds (default 5)')
     parser.add_argument('-threads', action='store', type=int, default=10,
                         help='concurrent hosts to scan (default 10)')
+    parser.add_argument('-o', '--output', action='store', dest='output',
+                        metavar='FILE', help='also append plain-text results to FILE')
+    parser.add_argument('-no-color', action='store_true', dest='no_color',
+                        help='disable coloured output')
+    parser.add_argument('-v', '--verbose', action='store_true', dest='verbose',
+                        help='also print unreachable / no-RPC hosts')
 
     if len(sys.argv) == 1:
         parser.print_help()
@@ -367,7 +430,8 @@ def main():
     logger.init()
     logging.getLogger().setLevel(logging.CRITICAL)
 
-    # Separate an optional credential prefix from the target spec.
+    USE_COLOR = sys.stdout.isatty() and not options.no_color
+
     if '@' in options.target:
         prefix, spec = options.target.rsplit('@', 1)
         domain, username, password = parse_creds(prefix)
@@ -384,6 +448,15 @@ def main():
         print('[-] No valid targets parsed.')
         sys.exit(1)
 
+    outfh = None
+    if options.output:
+        try:
+            outfh = open(options.output, 'a')
+            outfh.write('\n# rpcauthmap sweep of %d target(s)\n' % len(targets))
+        except Exception as e:
+            print('[-] Could not open output file: %s' % e)
+            outfh = None
+
     print('[*] Sweeping %d host(s) with %d thread(s)...\n'
           % (len(targets), options.threads))
 
@@ -395,21 +468,39 @@ def main():
         )
         return host, mapper.scan(host)
 
-    total_relay = 0
-    hosts_with_hits = 0
+    total_relay = hosts_with_hits = hosts_scanned = hosts_quiet = 0
     with ThreadPoolExecutor(max_workers=max(1, options.threads)) as pool:
         futures = [pool.submit(worker, h) for h in targets]
         for fut in as_completed(futures):
-            host, (relay_count, lines) = fut.result()
-            if relay_count:
-                hosts_with_hits += 1
-            total_relay += relay_count
-            with _print_lock:
-                print('\n'.join(lines))
-                print('')
+            host, (relay_count, lines, status) = fut.result()
+            if status == 'scanned':
+                hosts_scanned += 1
+                if relay_count:
+                    hosts_with_hits += 1
+                total_relay += relay_count
+            else:
+                hosts_quiet += 1
 
-    print('[*] Sweep complete: %d relay-viable RPC endpoint(s) across %d host(s).'
-          % (total_relay, hosts_with_hits))
+            if status == 'scanned' or options.verbose:
+                block = '\n'.join(lines)
+                with _print_lock:
+                    print(block)
+                    print('')
+                    if outfh:
+                        outfh.write(strip_ansi(block) + '\n\n')
+                        outfh.flush()
+
+    summary1 = ('[*] Sweep complete: %d target(s) probed; %d live RPC host(s) '
+                'scanned, %d unreachable/no-RPC.'
+                % (len(targets), hosts_scanned, hosts_quiet))
+    summary2 = ('[*] %d relay-viable RPC endpoint(s) found on %d host(s).'
+                % (total_relay, hosts_with_hits))
+    print(summary1)
+    print(summary2)
+    if outfh:
+        outfh.write(summary1 + '\n' + summary2 + '\n')
+        outfh.close()
+        print('[*] Plain-text results appended to %s' % options.output)
 
 
 if __name__ == '__main__':
